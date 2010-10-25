@@ -259,6 +259,11 @@ USBDevice *usb_host_device_open(const char *devname);
 int usb_host_device_close(const char *devname);
 void usb_host_info(Monitor *mon);
 
+/* usb-socket.c */
+USBDevice *usb_socket_device_open(const char *devname);
+int usb_socket_device_close(const char *devname);
+
+
 /* usb-hid.c */
 void usb_hid_datain_cb(USBDevice *dev, void *opaque, void (*datain)(void *));
 

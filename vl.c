@@ -833,6 +833,8 @@ static int usb_device_add(const char *devname)
     /* the other ones */
     if (strstart(devname, "host:", &p)) {
         dev = usb_host_device_open(p);
+    } else if (strstart(devname, "unix:", &p)) {
+        dev = usb_socket_device_open(p);
     } else if (!strcmp(devname, "bt") || strstart(devname, "bt:", &p)) {
         dev = usb_bt_init(devname[2] ? hci_init(p) :
                         bt_new_hci(qemu_find_bt_vlan(0)));
