@@ -1,6 +1,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <stdlib.h>
+#include <poll.h>
 
 #include "qemu-common.h"
 #include "qemu-timer.h"
@@ -14,22 +15,41 @@ typedef struct USBSocketDevice {
     int       fd;
     Notifier  exit;
     char      *path;
+    struct    sockaddr_un remote;
 
     QTAILQ_ENTRY(USBSocketDevice) next;
 } USBSocketDevice;
 
 static QTAILQ_HEAD(, USBSocketDevice) socketdevs = QTAILQ_HEAD_INITIALIZER(socketdevs);
 
+
+static void socket_read(void *opaque)
+{
+    USBSocketDevice *s = opaque;
+    uint8_t tag;
+    socklen_t len=sizeof(struct sockaddr_un);
+    printf("usb-socket: len %u\n",len);
+    if(recvfrom(s->fd,&tag,1,0,(struct sockaddr*)&s->remote,&len)==1) {
+      if(tag==0xff) {
+        printf("usb-socket: attach\n");
+        if(connect(s->fd,(struct sockaddr*)&(s->remote),len)==0) {
+            usb_device_attach(&s->dev);
+        } else {
+            perror("usb-socket: connect failed");
+        }
+      }
+      if(tag==0xfe) {
+        printf("usb-socket: detach\n");
+        usb_device_detach(&s->dev);
+      }
+    }
+}
+
+
 static void usb_socket_exit_notifier(struct Notifier* n)
 {
     //USBSocketDevice *s = container_of(n, USBSocketDevice, exit);
     // well... unplug here
-}
-
-static void usb_socket_handle_reset(USBDevice *dev)
-{
-    // USBSocketDevice *s = DO_UPCAST(USBSocketDevice, dev, dev);
-    // well... reset here
 }
 
 static void usb_socket_handle_destroy(USBDevice *dev)
@@ -38,62 +58,121 @@ static void usb_socket_handle_destroy(USBDevice *dev)
 
     // well... detach?
 
+    qemu_set_fd_handler(s->fd, NULL, NULL, NULL);
     if(s->path) free(s->path);
     QTAILQ_REMOVE(&socketdevs, s, next);
     qemu_remove_exit_notifier(&s->exit);
 }
 
 
-static int send_to_sock(int id, USBDevice *dev, USBPacket *p) {
+static int recv_reply(int fd, uint8_t *data, int len) {
+    uint8_t pre;
+    struct iovec io[2]={{&pre,1},{data,len}};
+    struct msghdr h={0,0,io,2,0,0,0};
+    int rcvd=recvmsg(fd,&h,0);
+    if(rcvd==1) {
+       if(pre==1) return USB_RET_NAK;
+       if(pre==2) return USB_RET_STALL;
+    }
+    if(rcvd<0) return USB_RET_NODEV;
+    return rcvd-1;
+}
+
+static int do_token_setup(USBDevice *dev, USBPacket *p) {
     USBSocketDevice *s = (USBSocketDevice *)dev;
-    uint8_t pre[2]={0,p->len};
+
+    printf("usb_socket: setup %u\n",p->len);
+
+    uint8_t pre[1]={0};
     if(p->len>0xff) {
         printf("usb-socket: wtf, packet too big\n");
         return -1;
     }
-    struct iovec io[2]={{pre,2},{p->data,p->len}};
+
+    qemu_set_fd_handler(s->fd, NULL, NULL, s);
+
+    int ret=-1;
+
+    struct iovec io[2]={{pre,1},{p->data,p->len}};
     struct msghdr h={0,0,io,2,0,0,0};
-    return !(sendmsg(s->fd,&h,0)==2+p->len);
+    if(sendmsg(s->fd,&h,0)==1+p->len) {
+        ret=recv_reply(s->fd,p->data,p->len);
+    } else {
+        perror("usb_socket: setup failed");
+    }
+    qemu_set_fd_handler(s->fd, socket_read, NULL, s);
+    return ret;
 }
 
-static int usb_socket_handle_control(USBDevice *dev, int request, int value,
-                                    int index, int length, uint8_t *data)
+static int do_token_in(USBDevice *dev, USBPacket *p) {
+    printf("usb_socket: in\n");
+    return -1;
+}
+static int do_token_out(USBDevice *dev, USBPacket *p) {
+    printf("usb_socket: out\n");
+    return -1;
+}
+
+static int usb_socket_handle_packet(USBDevice *s, USBPacket *p)
 {
-    USBSocketDevice *s = (USBSocketDevice *)dev;
-    uint8_t pkt[10]={0,8,request>>8,request,value,value>>8,index,index>>8,length,length>>8};
-    if(send(s->fd,pkt,10,0)!=10) return -1;
-    return recv(s->fd,data,length,0);
-}
+    printf("usb_socket_handle_packet: pid=%u addr=%04x\n",p->pid,p->devaddr);
 
-static int usb_socket_handle_data(USBDevice *dev, USBPacket *p) {
-    USBSocketDevice *s = (USBSocketDevice *)dev;
-    switch (p->pid) {
-    case USB_TOKEN_IN:
-        if(send_to_sock(1,dev,p)) return -1;
-        return recv(s->fd,p->data,p->len,0);
-    case USB_TOKEN_OUT:
-        if(send_to_sock(2,dev,p)) return -1;
+    switch(p->pid) {
+    case USB_MSG_ATTACH:
+        s->state = USB_STATE_ATTACHED;
         return 0;
+
+    case USB_MSG_DETACH:
+        s->state = USB_STATE_NOTATTACHED;
+        return 0;
+
+    case USB_MSG_RESET:
+        s->remote_wakeup = 0;
+        s->addr = 0;
+        s->state = USB_STATE_DEFAULT;
+        return 0;
+    }
+
+    if (s->state < USB_STATE_DEFAULT || p->devaddr != s->addr)
+        return USB_RET_NODEV;
+
+    switch (p->pid) {
+    case USB_TOKEN_SETUP:
+        return do_token_setup(s, p);
+
+    case USB_TOKEN_IN:
+        return do_token_in(s, p);
+
+    case USB_TOKEN_OUT:
+        return do_token_out(s, p);
+ 
     default:
         return USB_RET_STALL;
     }
-
 }
+
 
 static int usb_socket_initfn(USBDevice *dev)
 {
     USBSocketDevice *s = DO_UPCAST(USBSocketDevice, dev, dev);
 
+    dev->auto_attach = 0;
     dev->speed = USB_SPEED_FULL;
     s->fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     struct sockaddr_un remote={.sun_family=AF_UNIX};
     strncpy(remote.sun_path,s->path,sizeof(remote.sun_path)-1);
-    if (connect(s->fd, (struct sockaddr *)&remote, strlen(remote.sun_path) + sizeof(remote.sun_family)) == -1) {
+
+    unlink(remote.sun_path);
+    if( bind(s->fd, (struct sockaddr *)&remote, strlen(remote.sun_path) + sizeof(remote.sun_family)) == -1) {
 	close(s->fd);
 	s->fd=-1;
-        perror("usb socket connect");
+        perror("usb socket bind");
 	return -1;
     }
+
+    printf("usb-socket: initfn\n");
+
+    qemu_set_fd_handler(s->fd, socket_read, NULL, s);
 
     QTAILQ_INSERT_TAIL(&socketdevs, s, next);
     s->exit.notify = usb_socket_exit_notifier;
@@ -126,11 +205,8 @@ static struct USBDeviceInfo usb_socket_dev_info = {
     .init           = usb_socket_initfn,
 
 
-    .handle_packet  = usb_generic_handle_packet,
-    .handle_control = usb_socket_handle_control,
-    .handle_data    = usb_socket_handle_data,
+    .handle_packet  = usb_socket_handle_packet,
 
-    .handle_reset   = usb_socket_handle_reset,
     .handle_destroy = usb_socket_handle_destroy,
     .usbdevice_name = "socket",
     .usbdevice_init = usb_socket_device_open,
