@@ -18,6 +18,9 @@ typedef struct USBSocketDevice {
     char      *path;
     struct    sockaddr_un remote;
 
+    int       indata;
+    uint16_t  set_addr;
+
     QTAILQ_ENTRY(USBSocketDevice) next;
 } USBSocketDevice;
 
@@ -29,7 +32,6 @@ static void socket_read(void *opaque)
     USBSocketDevice *s = opaque;
     uint8_t tag;
     socklen_t len=sizeof(struct sockaddr_un);
-    printf("usb-socket: len %u\n",len);
     if(recvfrom(s->fd,&tag,1,0,(struct sockaddr*)&s->remote,&len)==1) {
       if(tag==0xff) {
         printf("usb-socket: attach\n");
@@ -75,7 +77,10 @@ static int recv_reply(int fd, uint8_t *data, int len) {
     sigfillset(&all);
 
     int ret=ppoll(&p,1,&t,&all);
-    if(ret!=1) {
+    if(ret==0) {
+        perror("usb_socket: timeout\n");
+        return -1;
+    } else if(ret!=1) {
         perror("usb_socket: poll failed\n");
         return -1;
     }
@@ -85,21 +90,33 @@ static int recv_reply(int fd, uint8_t *data, int len) {
     uint8_t pre;
     struct iovec io[2]={{&pre,1},{data,len}};
     struct msghdr h={0,0,io,2,0,0,0};
+
     int rcvd=recvmsg(fd,&h,0);
+    printf("usb_socket: recv %u (wanted %u)\n",rcvd,len);
     if(rcvd==1) {
-       if(pre==1) return USB_RET_NAK;
-       if(pre==2) return USB_RET_STALL;
-    }
-    if(rcvd<0) return USB_RET_NODEV;
-    return rcvd-1;
+       if(pre==1) ret=USB_RET_NAK;
+       else if(pre==2) ret=USB_RET_STALL;
+       else ret=0;
+    } else if(rcvd<0) { ret=USB_RET_NODEV; }
+    else ret=rcvd-1;
+
+    printf("usb_socket: recv returns %u\n",ret);
+    return ret;
+}
+
+static void dumphex(const char *s,const uint8_t *buf, int len) {
+	int i;
+	printf("%s",s);
+	for(i=0;i<len;i++) { printf(" %02x",buf[i]); }
+	printf("\n");
 }
 
 static int do_token_setup(USBDevice *dev, USBPacket *p) {
     USBSocketDevice *s = (USBSocketDevice *)dev;
 
     printf("usb_socket: setup %u\n",p->len);
+    dumphex("  SETUP:",p->data,p->len);
 
-    uint8_t pre[1]={0};
     if(p->len>0xff) {
         printf("usb-socket: wtf, packet too big\n");
         return -1;
@@ -108,7 +125,10 @@ static int do_token_setup(USBDevice *dev, USBPacket *p) {
     qemu_set_fd_handler(s->fd, NULL, NULL, s);
 
     int ret=-1;
+    s->set_addr=(p->data[0]==0 && p->data[1]==0x05) ? (p->data[2]|(p->data[3]<<8)) : 0;
+    s->indata=0;
 
+    uint8_t pre[1]={0};
     struct iovec io[2]={{pre,1},{p->data,p->len}};
     struct msghdr h={0,0,io,2,0,0,0};
     if(sendmsg(s->fd,&h,0)==1+p->len) {
@@ -116,17 +136,49 @@ static int do_token_setup(USBDevice *dev, USBPacket *p) {
     } else {
         perror("usb_socket: setup failed");
     }
+
     qemu_set_fd_handler(s->fd, socket_read, NULL, s);
+
     return ret;
 }
 
 static int do_token_in(USBDevice *dev, USBPacket *p) {
-    printf("usb_socket: in\n");
+    USBSocketDevice *s = (USBSocketDevice *)dev;
+    printf("usb_socket: in ep%u\n",p->devep);
+    uint8_t pkt[2]={1,p->devep};
+
+    if(p->devep==0) s->indata=1;
+    
+    if(send(s->fd,pkt,2,0)==2) {
+        int ret=recv_reply(s->fd,p->data,p->len);
+	if(s->set_addr) {
+        	printf("usb-socket: set address to %04hx\n",s->set_addr);
+		dev->addr=s->set_addr;
+		s->set_addr=0;
+	}
+	return ret;
+    }
     return -1;
 }
 static int do_token_out(USBDevice *dev, USBPacket *p) {
-    printf("usb_socket: out\n");
-    return -1;
+    USBSocketDevice *s = (USBSocketDevice *)dev;
+    printf("usb_socket: out ep%u\n",p->devep);
+    dumphex("  OUT:",p->data,p->len);
+
+    if(p->devep==0 && p->len==0 && s->indata) return 0;
+
+    int ret=-1;
+
+    uint8_t pre[2]={2,p->devep};
+    struct iovec io[2]={{pre,2},{p->data,p->len}};
+    struct msghdr h={0,0,io,2,0,0,0};
+    if(sendmsg(s->fd,&h,0)==1+p->len) {
+        ret=recv_reply(s->fd,p->data,p->len);
+    } else {
+        perror("usb_socket: out failed");
+    }
+
+    return ret;
 }
 
 static int usb_socket_handle_packet(USBDevice *s, USBPacket *p)
