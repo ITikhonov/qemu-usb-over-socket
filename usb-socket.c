@@ -2,6 +2,7 @@
 #include <sys/un.h>
 #include <stdlib.h>
 #include <poll.h>
+#include <signal.h>
 
 #include "qemu-common.h"
 #include "qemu-timer.h"
@@ -66,6 +67,21 @@ static void usb_socket_handle_destroy(USBDevice *dev)
 
 
 static int recv_reply(int fd, uint8_t *data, int len) {
+    printf("usb_socket: start recv %u\n",len);
+
+    struct pollfd p={.fd=fd,.events=POLLIN};
+    struct timespec t={.tv_sec=1,.tv_nsec=0};
+    sigset_t all;
+    sigfillset(&all);
+
+    int ret=ppoll(&p,1,&t,&all);
+    if(ret!=1) {
+        perror("usb_socket: poll failed\n");
+        return -1;
+    }
+
+    printf("usb_socket: going to recv %u\n",len);
+
     uint8_t pre;
     struct iovec io[2]={{&pre,1},{data,len}};
     struct msghdr h={0,0,io,2,0,0,0};
